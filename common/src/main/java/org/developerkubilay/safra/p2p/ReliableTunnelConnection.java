@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -47,6 +48,11 @@ final class ReliableTunnelConnection implements AutoCloseable {
     private final long diagnosticsSummaryMs;
     private final long diagnosticsTickDriftWarnMs;
     private final CountDownLatch openLatch = new CountDownLatch(1);
+    private final SafraTunnelCrypto crypto;
+    private final CountDownLatch handshakeLatch = new CountDownLatch(1);
+    private final Object handshakeMonitor = new Object();
+    private volatile boolean handshakeResolved;
+    private volatile boolean encryptionActive;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicInteger nextSendSequence = new AtomicInteger(1);
     private final AtomicInteger nextExpectedSequence = new AtomicInteger(1);
@@ -193,6 +199,19 @@ final class ReliableTunnelConnection implements AutoCloseable {
         this.diagnosticsLoggingEnabled = P2pConstants.diagnosticsEnabled();
         this.diagnosticsSummaryMs = diagnosticsLoggingEnabled ? P2pConstants.diagnosticsSummaryMs() : 0L;
         this.diagnosticsTickDriftWarnMs = diagnosticsLoggingEnabled ? P2pConstants.diagnosticsTickDriftWarnMs() : 0L;
+        this.crypto = createCrypto(logger);
+    }
+
+    private static SafraTunnelCrypto createCrypto(Logger logger) {
+        if (!P2pConstants.encryptionEnabled()) {
+            return null;
+        }
+        try {
+            return new SafraTunnelCrypto();
+        } catch (GeneralSecurityException exception) {
+            logger.warn("Safra tunnel encryption unavailable, falling back to plaintext: {}", exception.toString());
+            return null;
+        }
     }
 
     void start() throws IOException {
@@ -222,13 +241,17 @@ final class ReliableTunnelConnection implements AutoCloseable {
         long now = System.currentTimeMillis();
         lastPacketReceivedAt = now;
         switch (packet.type()) {
-            case OPEN_ACK -> markOpened(now);
+            case OPEN_ACK -> {
+                resolveHandshake(packet.payload());
+                markOpened(now);
+            }
             case DATA -> handleData(packet, now);
             case ACK -> processAcknowledgement(packet.acknowledgement(), packet.acknowledgementMask(), now);
             case NACK -> handleNegativeAcknowledgement(packet);
             case CLOSE -> closeWithoutNotify("remote closed");
             case OPEN -> {
                 if (!initiator) {
+                    resolveHandshake(packet.payload());
                     sendOpenAck(now);
                 }
             }
@@ -236,11 +259,11 @@ final class ReliableTunnelConnection implements AutoCloseable {
     }
 
     void sendOpenAck() {
-        sendPacket(P2pPacket.openAck(token, connectionId));
+        sendPacket(P2pPacket.openAck(token, connectionId, localHandshake()));
     }
 
     void sendOpenAck(long now) {
-        sendPacket(P2pPacket.openAck(token, connectionId), now);
+        sendPacket(P2pPacket.openAck(token, connectionId, localHandshake()), now);
     }
 
     @Override
@@ -250,12 +273,13 @@ final class ReliableTunnelConnection implements AutoCloseable {
 
     private void tcpReaderLoop() {
         awaitOpen();
+        awaitHandshake();
         if (closed.get()) {
             return;
         }
 
         try (InputStream inputStream = tcpSocket.getInputStream()) {
-            byte[] buffer = new byte[P2pConstants.MAX_PAYLOAD_SIZE];
+            byte[] buffer = new byte[P2pConstants.MAX_PLAINTEXT_PAYLOAD_SIZE];
             while (!closed.get()) {
                 waitForWindow();
                 if (inputStream.available() <= 0) {
@@ -275,8 +299,12 @@ final class ReliableTunnelConnection implements AutoCloseable {
                 long now = System.currentTimeMillis();
                 maybeRestartSendWindowAfterIdle(now);
                 addDiagnosticCounter(tcpReadBytes, read);
-                byte[] payload = Arrays.copyOf(buffer, read);
+                byte[] plaintext = Arrays.copyOf(buffer, read);
                 int sequence = nextSendSequence.getAndIncrement();
+                byte[] payload = sealPayload(plaintext, sequence);
+                if (payload == null) {
+                    return;
+                }
                 pendingSegments.put(sequence, new PendingSegment(sequence, payload));
                 observePeak(peakPendingSegments, pendingSegments.size());
                 waitForPacingSlot();
@@ -325,7 +353,7 @@ final class ReliableTunnelConnection implements AutoCloseable {
 
     private void handleData(P2pPacket packet, long now) {
         processAcknowledgement(packet.acknowledgement(), 0, now);
-        if (!opened) {
+        if (!opened && (crypto == null || handshakeResolved)) {
             markOpened(now);
         }
 
@@ -371,6 +399,11 @@ final class ReliableTunnelConnection implements AutoCloseable {
     }
 
     private void flushReceiveBuffer() {
+        if (crypto != null && !handshakeResolved) {
+            // Hold delivery until the session key is ready, so we never write
+            // sealed bytes to the local socket if DATA outruns the handshake.
+            return;
+        }
         while (true) {
             int expected = nextExpectedSequence.get();
             byte[] payload = receiveBuffer.remove(expected);
@@ -378,8 +411,12 @@ final class ReliableTunnelConnection implements AutoCloseable {
                 return;
             }
 
-            inboundQueue.offer(payload);
-            addDiagnosticCounter(inboundQueueBytes, payload.length);
+            byte[] plaintext = openPayload(payload, expected);
+            if (plaintext == null) {
+                return;
+            }
+            inboundQueue.offer(plaintext);
+            addDiagnosticCounter(inboundQueueBytes, plaintext.length);
             observePeak(peakInboundQueueDepth, inboundQueue.size());
             observePeak(peakInboundQueueBytes, inboundQueueBytes.get());
             nextExpectedSequence.incrementAndGet();
@@ -518,7 +555,7 @@ final class ReliableTunnelConnection implements AutoCloseable {
             logger.info("Safra test modu {} connection {} OPEN gonderdi attempt={} remote={}",
                 side, connectionId, openPacketsSent, remoteAddress);
         }
-        sendPacket(P2pPacket.open(token, connectionId), now);
+        sendPacket(P2pPacket.open(token, connectionId, localHandshake()), now);
     }
 
     private void sendData(int sequence, byte[] payload, long now) {
@@ -583,6 +620,67 @@ final class ReliableTunnelConnection implements AutoCloseable {
         }
     }
 
+    private void awaitHandshake() {
+        if (crypto == null) {
+            return;
+        }
+        try {
+            handshakeLatch.await();
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private byte[] localHandshake() {
+        return crypto == null ? new byte[0] : crypto.localPublicKey();
+    }
+
+    private void resolveHandshake(byte[] peerHandshake) {
+        if (handshakeResolved) {
+            return;
+        }
+        synchronized (handshakeMonitor) {
+            if (handshakeResolved) {
+                return;
+            }
+            if (crypto != null && crypto.establish(peerHandshake, initiator)) {
+                encryptionActive = true;
+                logger.debug("{} connection {} encrypted tunnel established with {}", side, connectionId, remoteAddress);
+            } else {
+                encryptionActive = false;
+                if (crypto != null) {
+                    logger.debug("{} connection {} peer advertised no key, using plaintext", side, connectionId);
+                }
+            }
+            handshakeResolved = true;
+            handshakeLatch.countDown();
+        }
+    }
+
+    private byte[] sealPayload(byte[] plaintext, int sequence) {
+        if (!encryptionActive) {
+            return plaintext;
+        }
+        try {
+            return crypto.encrypt(plaintext, sequence);
+        } catch (GeneralSecurityException exception) {
+            closeFromError("encrypt", exception);
+            return null;
+        }
+    }
+
+    private byte[] openPayload(byte[] payload, int sequence) {
+        if (!encryptionActive) {
+            return payload;
+        }
+        try {
+            return crypto.decrypt(payload, sequence);
+        } catch (GeneralSecurityException exception) {
+            closeFromError("decrypt", exception);
+            return null;
+        }
+    }
+
     private void closeLocally(String reason) {
         if (!closed.compareAndSet(false, true)) {
             return;
@@ -613,6 +711,7 @@ final class ReliableTunnelConnection implements AutoCloseable {
         cancelTask(delayedAcknowledgementTask);
         cancelTask(acknowledgementReinforcementTask);
         openLatch.countDown();
+        handshakeLatch.countDown();
 
         try {
             tcpSocket.close();

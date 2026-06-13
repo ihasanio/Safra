@@ -33,11 +33,19 @@ record P2pPacket(Type type, int token, int connectionId, int sequence, int ackno
     }
 
     static P2pPacket open(int token, int connectionId) {
-        return new P2pPacket(Type.OPEN, token, connectionId, 0, 0, new byte[0]);
+        return open(token, connectionId, new byte[0]);
+    }
+
+    static P2pPacket open(int token, int connectionId, byte[] handshake) {
+        return new P2pPacket(Type.OPEN, token, connectionId, 0, 0, handshake);
     }
 
     static P2pPacket openAck(int token, int connectionId) {
-        return new P2pPacket(Type.OPEN_ACK, token, connectionId, 0, 0, new byte[0]);
+        return openAck(token, connectionId, new byte[0]);
+    }
+
+    static P2pPacket openAck(int token, int connectionId, byte[] handshake) {
+        return new P2pPacket(Type.OPEN_ACK, token, connectionId, 0, 0, handshake);
     }
 
     static P2pPacket data(int token, int connectionId, int sequence, int acknowledgement, byte[] payload) {

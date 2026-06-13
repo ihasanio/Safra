@@ -6,6 +6,8 @@ public final class P2pConstants {
     static final int HEADER_SIZE = 18;
     static final int MAX_PAYLOAD_SIZE = 1100;
     static final int MAX_DATAGRAM_SIZE = HEADER_SIZE + MAX_PAYLOAD_SIZE;
+    static final int AEAD_TAG_SIZE = 16;
+    static final int MAX_PLAINTEXT_PAYLOAD_SIZE = MAX_PAYLOAD_SIZE - AEAD_TAG_SIZE;
     static final int SEND_WINDOW_SIZE = 32;
     static final int INITIAL_SEND_WINDOW_SIZE = 32;
     static final int MAX_SEND_WINDOW_SIZE = 128;
@@ -137,6 +139,20 @@ public final class P2pConstants {
         }
 
         return "";
+    }
+
+    static boolean encryptionEnabled() {
+        String property = System.getProperty("safra.p2p.encryption");
+        if (property != null && !property.isBlank()) {
+            return Boolean.parseBoolean(property.trim());
+        }
+
+        String environment = System.getenv("SAFRA_ENCRYPTION");
+        if (environment != null && !environment.isBlank()) {
+            return Boolean.parseBoolean(environment.trim());
+        }
+
+        return true;
     }
 
     static boolean diagnosticsEnabled() {
